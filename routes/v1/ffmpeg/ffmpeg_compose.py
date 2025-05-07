@@ -1,149 +1,90 @@
-# Copyright (c) 2025 Stephen G. Pope
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, write to the Free Software Foundation, Inc.,
-# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+# Copyright (c) 2025 Stephen G. Pope, modifications by [Your Name/AI]
+# Based on NCA Toolkit structure
+# Licensed under GPL-2.0
 
-
-
-import os
 import logging
+import json
 from flask import Blueprint, request, jsonify
-from app_utils import *
-from services.v1.ffmpeg.ffmpeg_compose import process_ffmpeg_compose
-from services.authentication import authenticate
-from services.cloud_storage import upload_file
+from services.authentication import require_api_key
+from app import queue_task # Import the queue task decorator
 
-v1_ffmpeg_compose_bp = Blueprint('v1_ffmpeg_compose', __name__)
+# --- Added for Video Assembly Feature ---
+# Import the new video assembly service
+from services.v1.ffmpeg import video_assembly_service
+# --- End Added for Video Assembly Feature ---
+
+# Setup logger
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
-@v1_ffmpeg_compose_bp.route('/v1/ffmpeg/compose', methods=['POST'])
-@authenticate
-@validate_payload({
-    "type": "object",
-    "properties": {
-        "inputs": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "file_url": {"type": "string", "format": "uri"},
-                    "options": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "option": {"type": "string"},
-                                "argument": {"type": ["string", "number", "null"]}
-                            },
-                            "required": ["option"]
-                        }
-                    }
-                },
-                "required": ["file_url"]
-            },
-            "minItems": 1
-        },
-        "filters": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "filter": {"type": "string"}
-                },
-                "required": ["filter"]
-            }
-        },
-        "outputs": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "options": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "option": {"type": "string"},
-                                "argument": {"type": ["string", "number", "null"]}
-                            },
-                            "required": ["option"]
-                        }
-                    }
-                },
-                "required": ["options"]
-            },
-            "minItems": 1
-        },
-        "global_options": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "option": {"type": "string"},
-                    "argument": {"type": ["string", "number", "null"]}
-                },
-                "required": ["option"]
-            }
-        },
-        "metadata": {
-            "type": "object",
-            "properties": {
-                "thumbnail": {"type": "boolean"},
-                "filesize": {"type": "boolean"},
-                "duration": {"type": "boolean"},
-                "bitrate": {"type": "boolean"},
-                "encoder": {"type": "boolean"}
-            }
-        },
-        "webhook_url": {"type": "string", "format": "uri"},
-        "id": {"type": "string"}
-    },
-    "required": ["inputs", "outputs"],
-    "additionalProperties": False
-})
-@queue_task_wrapper(bypass_queue=False)
-def ffmpeg_api(job_id, data):
-    logger.info(f"Job {job_id}: Received flexible FFmpeg request")
+v1_ffmpeg_compose_bp = Blueprint('v1_ffmpeg_compose_bp', __name__, url_prefix='/v1/ffmpeg')
+
+# --- Placeholder for potential existing FFMPEG Compose Logic ---
+# If you had other logic here previously, you would merge it or keep it
+# accessible, perhaps via different checks within the handle_ffmpeg_compose function.
+def process_generic_ffmpeg_compose(data, job_id):
+    logger.warning(f"Job {job_id}: Received generic ffmpeg/compose request, no specific handler implemented yet.")
+    raise NotImplementedError("Generic ffmpeg/compose functionality not implemented yet.")
+# --- End Placeholder ---
+
+
+@v1_ffmpeg_compose_bp.route('/compose', methods=['POST'])
+@require_api_key
+@queue_task(bypass_queue=False) # Use the queue if webhook_url is present
+def handle_ffmpeg_compose(job_id, data):
+    """
+    Handles complex FFmpeg operations based on payload.
+    Routes to specific processors based on payload structure.
+    """
+    endpoint_name = '/v1/ffmpeg/compose'
+    logger.info(f"Job {job_id}: Received request on {endpoint_name} with data: {json.dumps(data)[:500]}...") # Log snippet
 
     try:
-        output_filenames, metadata = process_ffmpeg_compose(data, job_id)
-        
-        # Upload output files to GCP and create result array
-        output_urls = []
-        for i, output_filename in enumerate(output_filenames):
-            if os.path.exists(output_filename):
-                upload_url = upload_file(output_filename)
-                output_info = {"file_url": upload_url}
-                
-                if metadata and i < len(metadata):
-                    output_metadata = metadata[i]
-                    if 'thumbnail' in output_metadata:
-                        thumbnail_path = output_metadata['thumbnail']
-                        if os.path.exists(thumbnail_path):
-                            thumbnail_url = upload_file(thumbnail_path)
-                            del output_metadata['thumbnail']
-                            output_metadata['thumbnail_url'] = thumbnail_url
-                            os.remove(thumbnail_path)  # Clean up local thumbnail file
-                    output_info.update(output_metadata)
-                
-                output_urls.append(output_info)
-                os.remove(output_filename)  # Clean up local output file after upload
-            else:
-                raise Exception(f"Expected output file {output_filename} not found")
+        inputs = data.get("inputs", {})
 
-        return output_urls, "/v1/ffmpeg/compose", 200
-        
+        # --- Added for Video Assembly Feature ---
+        # Check if this is a Video Assembly Request based on expected keys
+        is_video_assembly_request = (
+            "image_sequence" in inputs and
+            isinstance(inputs["image_sequence"], list) and
+            "audio_input" in inputs and
+            isinstance(inputs["audio_input"], dict) and
+            "output_filename" in inputs
+        )
+
+        if is_video_assembly_request:
+            logger.info(f"Job {job_id}: Detected Video Assembly request. Routing to video_assembly_service.")
+            # Call the specific service function for video assembly
+            result = video_assembly_service.process_video_assembly(data, job_id)
+            logger.info(f"Job {job_id}: Video Assembly processing successful.")
+            # The result from the service is returned, which will be used in the webhook
+            return result, endpoint_name, 200
+        # --- End Added for Video Assembly Feature ---
+        else:
+            # ** Handle other potential ffmpeg/compose tasks here **
+            # If you have other logic that uses this endpoint, add checks for it here.
+            # Otherwise, raise the NotImplementedError.
+            logger.warning(f"Job {job_id}: Payload does not match Video Assembly structure. Generic compose not implemented.")
+            raise NotImplementedError("Payload structure not recognized for implemented ffmpeg/compose operations.")
+            # Example: Call a generic processor if needed
+            # result = process_generic_ffmpeg_compose(data, job_id)
+            # return result, endpoint_name, 200
+
+    except ValueError as ve: # Specific validation errors from services
+        logger.error(f"Job {job_id}: Validation Error in {endpoint_name}: {ve}")
+        return str(ve), endpoint_name, 400 # Bad Request
+    except FileNotFoundError as fnfe: # Specific file not found error
+         logger.error(f"Job {job_id}: File Not Found Error in {endpoint_name}: {fnfe}")
+         return str(fnfe), endpoint_name, 404 # Not Found
+    except ConnectionError as ce: # Specific connection/API errors (like GDrive)
+         logger.error(f"Job {job_id}: Connection/API Error in {endpoint_name}: {ce}")
+         return str(ce), endpoint_name, 502 # Bad Gateway (or appropriate status)
+    except NotImplementedError as nie:
+         logger.error(f"Job {job_id}: Not Implemented Error in {endpoint_name}: {nie}")
+         return str(nie), endpoint_name, 501 # Not Implemented
     except Exception as e:
-        logger.error(f"Job {job_id}: Error processing FFmpeg request - {str(e)}")
-        return str(e), "/v1/ffmpeg/compose", 500
+        # Catch-all for other unexpected errors during processing
+        logger.error(f"Job {job_id}: Unexpected error in {endpoint_name}: {e}", exc_info=True)
+        # Ensure a generic error message is returned to avoid leaking details
+        return "Internal server error during media processing.", endpoint_name, 500
+
