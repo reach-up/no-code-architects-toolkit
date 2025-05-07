@@ -5,7 +5,7 @@
 import logging
 import json
 from flask import Blueprint, request, jsonify
-from app import app # Import the Flask app instance
+from decorators import queue_task # Import the queue task decorator
 
 # --- Corrected Import for API Key Check ---
 # This import should now work as services/authentication.py exists
@@ -41,7 +41,7 @@ def process_generic_ffmpeg_compose(data, job_id):
 
 @v1_ffmpeg_compose_bp.route('/compose', methods=['POST'])
 @require_api_key # Decorator usage - THIS SHOULD NOW WORK
-@app.queue_task(bypass_queue=False) # Use the queue if webhook_url is present
+@queue_task(bypass_queue=False) # Use the queue if webhook_url is present
 def handle_ffmpeg_compose(job_id, data):
     """
     Handles complex FFmpeg operations based on payload.
