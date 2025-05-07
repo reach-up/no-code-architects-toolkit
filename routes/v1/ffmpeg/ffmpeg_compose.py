@@ -5,6 +5,7 @@
 import logging
 import json
 from flask import Blueprint, request, jsonify
+from app import app # Import the Flask app instance
 
 # --- Corrected Import for API Key Check ---
 # This import should now work as services/authentication.py exists
@@ -22,7 +23,6 @@ except ImportError:
     video_assembly_service = None # Define as None to avoid runtime errors later if logic depends on it
 # --- End Added for Video Assembly Feature ---
 
-from app import queue_task # Import the queue task decorator
 
 # Setup logger
 logger = logging.getLogger(__name__)
@@ -41,7 +41,7 @@ def process_generic_ffmpeg_compose(data, job_id):
 
 @v1_ffmpeg_compose_bp.route('/compose', methods=['POST'])
 @require_api_key # Decorator usage - THIS SHOULD NOW WORK
-@queue_task(bypass_queue=False) # Use the queue if webhook_url is present
+@app.queue_task(bypass_queue=False) # Use the queue if webhook_url is present
 def handle_ffmpeg_compose(job_id, data):
     """
     Handles complex FFmpeg operations based on payload.
