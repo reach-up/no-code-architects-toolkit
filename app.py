@@ -14,194 +14,147 @@
 # with this program; if not, write to the Free Software Foundation, Inc.,
 # 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
-
-
+import logging
+import os
+import time
+import threading
+import uuid
 from flask import Flask, request
 from queue import Queue
 from services.webhook import send_webhook
-import threading
-import uuid
-import os
-import time
-from version import BUILD_NUMBER  # Import the BUILD_NUMBER
-from app_utils import log_job_status  # Import the log_job_status function
+from version import BUILD_NUMBER
+from app_utils import log_job_status
 
+# Setup logger if not configured globally elsewhere
+# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# logger = logging.getLogger(__name__)
+
+# Read MAX_QUEUE_LENGTH from environment once
 MAX_QUEUE_LENGTH = int(os.environ.get('MAX_QUEUE_LENGTH', 0))
 
 def create_app():
     app = Flask(__name__)
 
-    # Create a queue to hold tasks
+    # --- In-memory Queue Setup ---
     task_queue = Queue()
-    queue_id = id(task_queue)  # Generate a single queue_id for this worker
+    # Use a more descriptive name for clarity, maybe globally unique if needed?
+    queue_id = f"queue_{id(task_queue)}"
 
-    # Function to process tasks from the queue
+    # Background thread function to process tasks from the queue
     def process_queue():
+        logger = logging.getLogger(__name__ + ".process_queue") # Specific logger
+        logger.info(f"Background task processor thread started for queue: {queue_id}")
         while True:
-            job_id, data, task_func, queue_start_time = task_queue.get()
-            queue_time = time.time() - queue_start_time
-            run_start_time = time.time()
-            pid = os.getpid()  # Get the PID of the actual processing thread
-            
-            # Log job status as running
-            log_job_status(job_id, {
-                "job_status": "running",
-                "job_id": job_id,
-                "queue_id": queue_id,
-                "process_id": pid,
-                "response": None
-            })
-            
-            response = task_func()
-            run_time = time.time() - run_start_time
-            total_time = time.time() - queue_start_time
+            try:
+                job_id, data, task_func_wrapper, queue_start_time = task_queue.get()
+                logger.info(f"Job {job_id}: Dequeued task.")
+                queue_time = time.time() - queue_start_time
+                run_start_time = time.time()
+                pid = os.getpid()
 
-            response_data = {
-                "endpoint": response[1],
-                "code": response[2],
-                "id": data.get("id"),
-                "job_id": job_id,
-                "response": response[0] if response[2] == 200 else None,
-                "message": "success" if response[2] == 200 else response[0],
-                "pid": pid,
-                "queue_id": queue_id,
-                "run_time": round(run_time, 3),
-                "queue_time": round(queue_time, 3),
-                "total_time": round(total_time, 3),
-                "queue_length": task_queue.qsize(),
-                "build_number": BUILD_NUMBER  # Add build number to response
-            }
-            
-            # Log job status as done
-            log_job_status(job_id, {
-                "job_status": "done",
-                "job_id": job_id,
-                "queue_id": queue_id,
-                "process_id": pid,
-                "response": response_data
-            })
+                log_job_status(job_id, {
+                    "job_status": "running",
+                    "job_id": job_id,
+                    "queue_id": queue_id,
+                    "process_id": pid,
+                    "response": None
+                })
 
-            # Only send webhook if webhook_url has an actual value (not an empty string)
-            if data.get("webhook_url") and data.get("webhook_url") != "":
-                send_webhook(data.get("webhook_url"), response_data)
+                # Execute the actual task function provided by the decorator
+                response_tuple = task_func_wrapper()
+                # Expecting (result_data, endpoint_name, status_code)
+                result_data, endpoint_name, status_code = response_tuple
 
-            task_queue.task_done()
+                run_time = time.time() - run_start_time
+                total_time = time.time() - queue_start_time
 
-    # Start the queue processing in a separate thread
-    threading.Thread(target=process_queue, daemon=True).start()
+                response_for_webhook = {
+                    "endpoint": endpoint_name,
+                    "code": status_code,
+                    "id": data.get("id"), # Original request ID from client
+                    "job_id": job_id, # API generated Job ID
+                    "response": result_data if status_code == 200 else None,
+                    "message": "success" if status_code == 200 else result_data, # Assuming result_data is error message on failure
+                    "pid": pid,
+                    "queue_id": queue_id,
+                    "run_time": round(run_time, 3),
+                    "queue_time": round(queue_time, 3),
+                    "total_time": round(total_time, 3),
+                    "queue_length": task_queue.qsize(), # Length *after* task completion
+                    "build_number": BUILD_NUMBER
+                }
 
-    # Decorator to add tasks to the queue or bypass it
-    def queue_task(bypass_queue=False):
-        def decorator(f):
-            def wrapper(*args, **kwargs):
-                job_id = str(uuid.uuid4())
-                data = request.json if request.is_json else {}
-                pid = os.getpid()  # Get PID for non-queued tasks
-                start_time = time.time()
-                
-                if bypass_queue or 'webhook_url' not in data:
-                    
-                    # Log job status as running immediately (bypassing queue)
-                    log_job_status(job_id, {
-                        "job_status": "running",
-                        "job_id": job_id,
-                        "queue_id": queue_id,
-                        "process_id": pid,
-                        "response": None
-                    })
-                    
-                    response = f(job_id=job_id, data=data, *args, **kwargs)
-                    run_time = time.time() - start_time
-                    
-                    response_obj = {
-                        "code": response[2],
-                        "id": data.get("id"),
-                        "job_id": job_id,
-                        "response": response[0] if response[2] == 200 else None,
-                        "message": "success" if response[2] == 200 else response[0],
-                        "run_time": round(run_time, 3),
-                        "queue_time": 0,
-                        "total_time": round(run_time, 3),
-                        "pid": pid,
-                        "queue_id": queue_id,
-                        "queue_length": task_queue.qsize(),
-                        "build_number": BUILD_NUMBER  # Add build number to response
-                    }
-                    
-                    # Log job status as done
-                    log_job_status(job_id, {
-                        "job_status": "done",
-                        "job_id": job_id,
-                        "queue_id": queue_id,
-                        "process_id": pid,
-                        "response": response_obj
-                    })
-                    
-                    return response_obj, response[2]
-                else:
-                    if MAX_QUEUE_LENGTH > 0 and task_queue.qsize() >= MAX_QUEUE_LENGTH:
-                        error_response = {
-                            "code": 429,
-                            "id": data.get("id"),
-                            "job_id": job_id,
-                            "message": f"MAX_QUEUE_LENGTH ({MAX_QUEUE_LENGTH}) reached",
-                            "pid": pid,
-                            "queue_id": queue_id,
-                            "queue_length": task_queue.qsize(),
-                            "build_number": BUILD_NUMBER  # Add build number to response
-                        }
-                        
-                        # Log the queue overflow error
-                        log_job_status(job_id, {
-                            "job_status": "done",
-                            "job_id": job_id,
-                            "queue_id": queue_id,
-                            "process_id": pid,
-                            "response": error_response
-                        })
-                        
-                        return error_response, 429
-                    
-                    # Log job status as queued
-                    log_job_status(job_id, {
-                        "job_status": "queued",
-                        "job_id": job_id,
-                        "queue_id": queue_id,
-                        "process_id": pid,
-                        "response": None
-                    })
-                    
-                    task_queue.put((job_id, data, lambda: f(job_id=job_id, data=data, *args, **kwargs), start_time))
-                    
-                    return {
-                        "code": 202,
-                        "id": data.get("id"),
-                        "job_id": job_id,
-                        "message": "processing",
-                        "pid": pid,
-                        "queue_id": queue_id,
-                        "max_queue_length": MAX_QUEUE_LENGTH if MAX_QUEUE_LENGTH > 0 else "unlimited",
-                        "queue_length": task_queue.qsize(),
-                        "build_number": BUILD_NUMBER  # Add build number to response
-                    }, 202
-            return wrapper
-        return decorator
+                log_job_status(job_id, {
+                    "job_status": "done",
+                    "job_id": job_id,
+                    "queue_id": queue_id,
+                    "process_id": pid,
+                    "response": response_for_webhook
+                })
+                logger.info(f"Job {job_id}: Task processing finished with status code {status_code}.")
 
-    app.queue_task = queue_task
+                webhook_url = data.get("webhook_url")
+                if webhook_url:
+                    try:
+                        send_webhook(webhook_url, response_for_webhook)
+                        logger.info(f"Job {job_id}: Successfully sent webhook to {webhook_url}")
+                    except Exception as webhook_error:
+                         logger.error(f"Job {job_id}: Failed to send webhook to {webhook_url}: {webhook_error}", exc_info=True)
 
-    # Import blueprints
+            except Exception as processing_error:
+                 # Log error if task_func_wrapper itself fails catastrophically
+                 # job_id might not be available if task_queue.get() failed, handle carefully
+                 current_job_id = "unknown"
+                 try:
+                      current_job_id = job_id if 'job_id' in locals() else "unknown"
+                      # Log failure status if possible
+                      error_resp_data = {"error": "Processing Error", "message": str(processing_error)}
+                      log_job_status(current_job_id, {
+                          "job_status": "failed",
+                          "job_id": current_job_id,
+                          "queue_id": queue_id if 'queue_id' in locals() else 'unknown',
+                          "process_id": pid if 'pid' in locals() else 'unknown',
+                          "response": error_resp_data
+                      })
+                      # Try sending failure webhook if data context is available
+                      if 'data' in locals() and data.get("webhook_url"):
+                           response_for_webhook = {
+                               "code": 500, "id": data.get("id"), "job_id": current_job_id,
+                               "message": f"Internal server error during task processing: {type(processing_error).__name__}",
+                               "response": None, "build_number": BUILD_NUMBER
+                           }
+                           send_webhook(data.get("webhook_url"), response_for_webhook)
+
+                 except Exception as inner_error:
+                     logger.error(f"Job {current_job_id}: CRITICAL error during task processing OR logging/webhook failure: {processing_error} / Inner: {inner_error}", exc_info=True)
+
+            finally:
+                 # Ensure task_done is called even if errors occur
+                 try:
+                     task_queue.task_done()
+                 except Exception as td_error:
+                      logger.error(f"Error calling task_done: {td_error}")
+
+
+    # Start the single background queue processing thread
+    # daemon=True ensures thread exits when main app exits
+    queue_processor_thread = threading.Thread(target=process_queue, daemon=True)
+    queue_processor_thread.start()
+    # --- End In-memory Queue Setup ---
+
+
+    # --- Import and Register Blueprints ---
+    # Original Routes (Legacy?)
     from routes.media_to_mp3 import convert_bp
     from routes.transcribe_media import transcribe_bp
     from routes.combine_videos import combine_bp
     from routes.audio_mixing import audio_mixing_bp
     from routes.gdrive_upload import gdrive_upload_bp
     from routes.authenticate import auth_bp
-    from routes.caption_video import caption_bp 
+    from routes.caption_video import caption_bp
     from routes.extract_keyframes import extract_keyframes_bp
     from routes.image_to_video import image_to_video_bp
-    
 
-    # Register blueprints
     app.register_blueprint(convert_bp)
     app.register_blueprint(transcribe_bp)
     app.register_blueprint(combine_bp)
@@ -211,13 +164,12 @@ def create_app():
     app.register_blueprint(caption_bp)
     app.register_blueprint(extract_keyframes_bp)
     app.register_blueprint(image_to_video_bp)
-    
-    
 
-    # version 1.0
+
+    # V1 Routes
     from routes.v1.ffmpeg.ffmpeg_compose import v1_ffmpeg_compose_bp
     from routes.v1.media.media_transcribe import v1_media_transcribe_bp
-    from routes.v1.media.feedback import v1_media_feedback_bp
+    from routes.v1.media.feedback import v1_media_feedback_bp, create_root_next_routes
     from routes.v1.media.convert.media_to_mp3 import v1_media_convert_mp3_bp
     from routes.v1.video.concatenate import v1_video_concatenate_bp
     from routes.v1.video.caption_video import v1_video_caption_bp
@@ -241,11 +193,6 @@ def create_app():
     app.register_blueprint(v1_ffmpeg_compose_bp)
     app.register_blueprint(v1_media_transcribe_bp)
     app.register_blueprint(v1_media_feedback_bp)
-    
-    # Register a special route for Next.js root asset paths
-    from routes.v1.media.feedback import create_root_next_routes
-    create_root_next_routes(app)
-    
     app.register_blueprint(v1_media_convert_mp3_bp)
     app.register_blueprint(v1_video_concatenate_bp)
     app.register_blueprint(v1_video_caption_bp)
@@ -266,9 +213,23 @@ def create_app():
     app.register_blueprint(v1_toolkit_job_status_bp)
     app.register_blueprint(v1_toolkit_jobs_status_bp)
 
+    # Register a special route for Next.js root asset paths (if needed)
+    create_root_next_routes(app)
+
+
+    # --- Attach queue and config to app context ---
+    # Make queue and config accessible for the decorator via app context
+    app.nca_task_queue = task_queue
+    app.config['MAX_QUEUE_LENGTH'] = MAX_QUEUE_LENGTH
+
+
     return app
 
+# --- Create the Flask app instance ---
 app = create_app()
 
+# --- Run the app ---
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080)
+    # Consider adding host and port configuration from env variables as well
+    # For development, 0.0.0.0 makes it accessible externally
+    app.run(host='0.0.0.0', port=8080) # debug=True should not be used in production
