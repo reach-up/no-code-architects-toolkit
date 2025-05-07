@@ -5,13 +5,24 @@
 import logging
 import json
 from flask import Blueprint, request, jsonify
+
+# --- Corrected Import for API Key Check ---
+# This import should now work as services/authentication.py exists
 from services.authentication import require_api_key
-from app import queue_task # Import the queue task decorator
+# --- End Corrected Import ---
 
 # --- Added for Video Assembly Feature ---
-# Import the new video assembly service
-from services.v1.ffmpeg import video_assembly_service
+# Import the new video assembly service (assuming apply_video_assembly_feature.sh was run)
+# If not, this import might fail until video_assembly_service.py exists
+try:
+    from services.v1.ffmpeg import video_assembly_service
+except ImportError:
+    # Fallback or log if the service isn't there yet
+    logging.getLogger(__name__).warning("video_assembly_service not found, ensure previous script was run.")
+    video_assembly_service = None # Define as None to avoid runtime errors later if logic depends on it
 # --- End Added for Video Assembly Feature ---
+
+from app import queue_task # Import the queue task decorator
 
 # Setup logger
 logger = logging.getLogger(__name__)
@@ -29,7 +40,7 @@ def process_generic_ffmpeg_compose(data, job_id):
 
 
 @v1_ffmpeg_compose_bp.route('/compose', methods=['POST'])
-@require_api_key
+@require_api_key # Decorator usage - THIS SHOULD NOW WORK
 @queue_task(bypass_queue=False) # Use the queue if webhook_url is present
 def handle_ffmpeg_compose(job_id, data):
     """
@@ -53,6 +64,11 @@ def handle_ffmpeg_compose(job_id, data):
         )
 
         if is_video_assembly_request:
+             # Check if the service was imported correctly
+            if video_assembly_service is None:
+                 logger.error(f"Job {job_id}: video_assembly_service is not available. Cannot process request.")
+                 raise ImportError("Video assembly service module could not be imported.")
+
             logger.info(f"Job {job_id}: Detected Video Assembly request. Routing to video_assembly_service.")
             # Call the specific service function for video assembly
             result = video_assembly_service.process_video_assembly(data, job_id)
@@ -82,9 +98,11 @@ def handle_ffmpeg_compose(job_id, data):
     except NotImplementedError as nie:
          logger.error(f"Job {job_id}: Not Implemented Error in {endpoint_name}: {nie}")
          return str(nie), endpoint_name, 501 # Not Implemented
+    except ImportError as ie: # Catch potential import error for video service
+         logger.error(f"Job {job_id}: Import Error: {ie}")
+         return "Internal server error: Required module missing.", endpoint_name, 500
     except Exception as e:
         # Catch-all for other unexpected errors during processing
         logger.error(f"Job {job_id}: Unexpected error in {endpoint_name}: {e}", exc_info=True)
         # Ensure a generic error message is returned to avoid leaking details
         return "Internal server error during media processing.", endpoint_name, 500
-
