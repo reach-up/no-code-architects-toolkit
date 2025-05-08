@@ -20,7 +20,7 @@ import os
 import logging
 from abc import ABC, abstractmethod
 from services.gcp_toolkit import upload_to_gcs
-from services.s3_toolkit import upload_to_s3
+from services.s3_toolkit import upload_file_to_s3
 from config import validate_env_vars
 from urllib.parse import urlparse
 
@@ -84,7 +84,7 @@ class S3CompatibleProvider(CloudStorageProvider):
                 logger.warning(f"Failed to parse Digital Ocean URL: {e}. Using provided values.")
 
     def upload_file(self, file_path: str) -> str:
-        return upload_to_s3(file_path, self.endpoint_url, self.access_key, self.secret_key, self.bucket_name, self.region)
+        return upload_file_to_s3(file_path, self.endpoint_url, self.access_key, self.secret_key, self.bucket_name, self.region)
 
 def get_storage_provider() -> CloudStorageProvider:
     
