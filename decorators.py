@@ -30,7 +30,7 @@ def queue_task(bypass_queue=False):
             pid = os.getpid()
             start_time = time.time()
             webhook_url = data.get("webhook_url")
-            should_bypass = bypass_queue or not webhook_url
+            should_bypass = bypass_queue
 
             if should_bypass:
                 logger.info(f"Job {job_id}: Executing synchronously (bypass_queue={bypass_queue}, no_webhook={not webhook_url}).")

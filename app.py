@@ -21,7 +21,8 @@ import threading
 import uuid
 from flask import Flask, request
 from queue import Queue
-from services.webhook import send_webhook
+# send_webhook import is no longer needed if webhooks are fully removed
+# from services.webhook import send_webhook 
 from version import BUILD_NUMBER
 from app_utils import log_job_status
 
@@ -45,6 +46,8 @@ def create_app():
         logger = logging.getLogger(__name__ + ".process_queue") # Specific logger
         logger.info(f"Background task processor thread started for queue: {queue_id}")
         while True:
+            job_id = "unknown_job" # Default in case get fails before job_id is assigned
+            data = {} # Default data
             try:
                 job_id, data, task_func_wrapper, queue_start_time = task_queue.get()
                 logger.info(f"Job {job_id}: Dequeued task.")
@@ -68,7 +71,8 @@ def create_app():
                 run_time = time.time() - run_start_time
                 total_time = time.time() - queue_start_time
 
-                response_for_webhook = {
+                # This dictionary is still useful for logging the job outcome
+                job_outcome_details = {
                     "endpoint": endpoint_name,
                     "code": status_code,
                     "id": data.get("id"), # Original request ID from client
@@ -89,51 +93,55 @@ def create_app():
                     "job_id": job_id,
                     "queue_id": queue_id,
                     "process_id": pid,
-                    "response": response_for_webhook
+                    "response": job_outcome_details # Log the detailed outcome
                 })
                 logger.info(f"Job {job_id}: Task processing finished with status code {status_code}.")
 
-                webhook_url = data.get("webhook_url")
-                if webhook_url:
-                    try:
-                        send_webhook(webhook_url, response_for_webhook)
-                        logger.info(f"Job {job_id}: Successfully sent webhook to {webhook_url}")
-                    except Exception as webhook_error:
-                         logger.error(f"Job {job_id}: Failed to send webhook to {webhook_url}: {webhook_error}", exc_info=True)
+                # Webhook sending logic REMOVED
+                # webhook_url = data.get("webhook_url")
+                # if webhook_url:
+                #    try:
+                #        send_webhook(webhook_url, job_outcome_details) # Use job_outcome_details
+                #        logger.info(f"Job {job_id}: Successfully sent webhook to {webhook_url}")
+                #    except Exception as webhook_error:
+                #         logger.error(f"Job {job_id}: Failed to send webhook to {webhook_url}: {webhook_error}", exc_info=True)
 
             except Exception as processing_error:
-                 # Log error if task_func_wrapper itself fails catastrophically
-                 # job_id might not be available if task_queue.get() failed, handle carefully
-                 current_job_id = "unknown"
-                 try:
-                      current_job_id = job_id if 'job_id' in locals() else "unknown"
-                      # Log failure status if possible
-                      error_resp_data = {"error": "Processing Error", "message": str(processing_error)}
-                      log_job_status(current_job_id, {
-                          "job_status": "failed",
-                          "job_id": current_job_id,
-                          "queue_id": queue_id if 'queue_id' in locals() else 'unknown',
-                          "process_id": pid if 'pid' in locals() else 'unknown',
-                          "response": error_resp_data
-                      })
-                      # Try sending failure webhook if data context is available
-                      if 'data' in locals() and data.get("webhook_url"):
-                           response_for_webhook = {
-                               "code": 500, "id": data.get("id"), "job_id": current_job_id,
-                               "message": f"Internal server error during task processing: {type(processing_error).__name__}",
-                               "response": None, "build_number": BUILD_NUMBER
-                           }
-                           send_webhook(data.get("webhook_url"), response_for_webhook)
+                # Log error if task_func_wrapper itself fails catastrophically
+                # job_id might not be available if task_queue.get() failed, handle carefully
+                current_job_id = job_id # job_id from outer scope if .get() succeeded
+                if current_job_id == "unknown_job" and 'job_id' in locals() and locals()['job_id'] != "unknown_job": # Check if task_queue.get() populated it
+                    current_job_id = locals()['job_id']
+                
+                logger.error(f"Job {current_job_id}: Error during task processing: {processing_error}", exc_info=True)
+                try:
+                     # Log failure status if possible
+                     error_resp_data = {"error": "Processing Error", "message": str(processing_error)}
+                     log_job_status(current_job_id, {
+                         "job_status": "failed",
+                         "job_id": current_job_id,
+                         "queue_id": queue_id if 'queue_id' in locals() else 'unknown',
+                         "process_id": pid if 'pid' in locals() else os.getpid(), # Get pid if not set
+                         "response": error_resp_data
+                     })
+                     # Webhook sending on failure REMOVED
+                     # if 'data' in locals() and data.get("webhook_url"):
+                     #      failure_webhook_payload = {
+                     #          "code": 500, "id": data.get("id"), "job_id": current_job_id,
+                     #          "message": f"Internal server error during task processing: {type(processing_error).__name__}",
+                     #          "response": None, "build_number": BUILD_NUMBER
+                     #      }
+                     #      send_webhook(data.get("webhook_url"), failure_webhook_payload)
 
-                 except Exception as inner_error:
-                     logger.error(f"Job {current_job_id}: CRITICAL error during task processing OR logging/webhook failure: {processing_error} / Inner: {inner_error}", exc_info=True)
+                except Exception as inner_error:
+                    logger.error(f"Job {current_job_id}: CRITICAL error during error logging for task: {processing_error} / Inner log error: {inner_error}", exc_info=True)
 
             finally:
-                 # Ensure task_done is called even if errors occur
-                 try:
-                     task_queue.task_done()
-                 except Exception as td_error:
-                      logger.error(f"Error calling task_done: {td_error}")
+                # Ensure task_done is called even if errors occur
+                try:
+                    task_queue.task_done()
+                except Exception as td_error:
+                     logger.error(f"Job {job_id if 'job_id' in locals() else 'unknown'}: Error calling task_done: {td_error}", exc_info=True)
 
 
     # Start the single background queue processing thread
