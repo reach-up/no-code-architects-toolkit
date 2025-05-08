@@ -1,20 +1,17 @@
-# Replace content of services/v1/ffmpeg/video_assembly_service.py
-
 import os
 import subprocess
 import logging
 import tempfile
 import shutil
-from services import gdrive_service # Keep for potential GDrive use
-from services import s3_toolkit # Use S3 toolkit
+import sys
+from services import gdrive_service
+from services import s3_toolkit
 import config
 
 logger = logging.getLogger(__name__)
-# Assuming logging is configured globally in app.py
-# logging.basicConfig(level=logging.INFO) # Remove if configured globally
+
 
 def generate_ffmpeg_command(image_inputs, audio_path, output_path, ffmpeg_options):
-    # --- This function remains the same ---
     command = ["ffmpeg"]
     filter_complex_parts = []
     input_mappings = []
@@ -37,10 +34,20 @@ def generate_ffmpeg_command(image_inputs, audio_path, output_path, ffmpeg_option
     if ffmpeg_options.get("fps_mode"): command.extend(["-fps_mode", ffmpeg_options["fps_mode"]])
     command.extend(["-pix_fmt", "yuv420p"])
     if "other_flags" in ffmpeg_options: command.extend(ffmpeg_options["other_flags"])
+    # Ensure -shortest is added if present in other_flags or as a separate option if needed
+    if "shortest" in ffmpeg_options and ffmpeg_options["shortest"] is True:
+         if "-shortest" not in command: # Avoid duplicates if already in other_flags
+             command.append("-shortest")
+    elif "-shortest" in command and ("shortest" not in ffmpeg_options or ffmpeg_options["shortest"] is False):
+         # This case is tricky, assumes -shortest might be wrongly in other_flags
+         # Safer to ensure it's only added if explicitly requested via ffmpeg_options
+         # For now, let's assume other_flags is handled correctly by user.
+         pass
+    
     command.append(output_path)
     logger.info(f"Generated FFmpeg command: {' '.join(command)}")
     return command
-    # --- End generate_ffmpeg_command ---
+
 
 def process_video_assembly(data, job_id):
     inputs = data.get("inputs", {}); outputs_spec = data.get("outputs", [])
@@ -51,7 +58,6 @@ def process_video_assembly(data, job_id):
     if not audio_input or not image_sequence: raise ValueError("Missing audio_input or image_sequence.")
 
     default_s3_bucket = getattr(config, 'S3_BUCKET_NAME', None)
-    # +++ Debug Log 1 +++
     logger.info(f"Job {job_id}: Inside process_video_assembly - Default S3 bucket from config: '{default_s3_bucket}' (Type: {type(default_s3_bucket)})")
 
     temp_dir = tempfile.mkdtemp(prefix=f"nca_{job_id}_", dir=config.LOCAL_STORAGE_PATH)
@@ -66,7 +72,6 @@ def process_video_assembly(data, job_id):
              download_tasks.append({"type": "gdrive", "id": audio_id, "path": local_audio_path})
         elif audio_source_type == "s3_object_key" and audio_input.get("object_key"):
              obj_key = audio_input['object_key']; bucket = audio_input.get("bucket_name", default_s3_bucket)
-             # +++ Debug Log 2 +++
              logger.info(f"Job {job_id}: Audio task - Bucket value determined: '{bucket}' (Type: {type(bucket)})")
              ext = os.path.splitext(audio_input.get("file_name", os.path.basename(obj_key)))[1] or ".tmp"
              local_audio_path = os.path.join(temp_dir, f"audio{ext}")
@@ -83,28 +88,24 @@ def process_video_assembly(data, job_id):
                  img_id = img_data['file_id']; local_img_path = os.path.join(temp_dir, f"image_{i}_{img_id}{ext}"); img_task = {"type": "gdrive", "id": img_id, "path": local_img_path}
             elif img_source_type == "s3_object_key" and img_data.get("object_key"):
                  obj_key = img_data['object_key']; bucket = img_data.get("bucket_name", default_s3_bucket)
-                 # +++ Debug Log 3 +++
                  logger.info(f"Job {job_id}: Image task {i} - Bucket value determined: '{bucket}' (Type: {type(bucket)})")
                  local_img_path = os.path.join(temp_dir, f"image_{i}{ext}")
                  img_task = {"type": "s3", "bucket": bucket, "key": obj_key, "path": local_img_path}
             else: raise ValueError(f"Invalid image {i} source_type/keys.")
             download_tasks.append(img_task); image_inputs_for_ffmpeg.append({'path': local_img_path, 'duration': duration})
 
-        # +++ Debug Log 4 +++
         logger.info(f"Job {job_id}: Final download_tasks list prepared: {download_tasks}")
 
         logger.info(f"Job {job_id}: Starting downloads for {len(download_tasks)} files...")
         for task_index, task in enumerate(download_tasks):
-            # +++ Debug Log 5 +++
             logger.info(f"Job {job_id}: Processing Task {task_index}: {task}")
-            task_bucket = task.get('bucket') # Get bucket value safely
+            task_bucket = task.get('bucket')
             logger.info(f"Job {job_id}: Task {task_index} bucket value from get: '{task_bucket}' (Type: {type(task_bucket)})")
 
             logger.info(f"Job {job_id}: Downloading {task['type']} source: {task.get('id') or task.get('key')}")
             if task['type'] == 'gdrive':
                  gdrive_service.download_gdrive_file(task['id'], task['path'])
             elif task['type'] == 's3':
-                 # Check the variable we logged
                  if not task_bucket:
                       logger.error(f"Job {job_id}: Raising ValueError because task_bucket ('{task_bucket}') is falsey.")
                       raise ValueError("Missing bucket name for S3 download.")
@@ -118,8 +119,16 @@ def process_video_assembly(data, job_id):
 
         logger.info(f"Job {job_id}: Executing FFmpeg command...")
         result = subprocess.run(ffmpeg_command, capture_output=True, text=True, check=False)
-        if result.returncode != 0: logger.error(f"Job {job_id}: FFmpeg failed. Stderr:\n{result.stderr}"); raise Exception(f"FFmpeg failed: {result.stderr}")
-        else: logger.info(f"Job {job_id}: FFmpeg successful."); logger.info(f"Job {job_id}: Output video at {local_output_path}")
+
+        if result.returncode != 0:
+            print(f"\n--- START FFmpeg Stderr (Job: {job_id}) ---", file=sys.stderr)
+            print(result.stderr, file=sys.stderr)
+            print(f"--- END FFmpeg Stderr (Job: {job_id}) ---\n", file=sys.stderr)
+            logger.error(f"Job {job_id}: FFmpeg failed. Stderr captured (See raw stderr print above/below in logs).")
+            raise Exception(f"FFmpeg failed (return code {result.returncode}). See logs for full stderr.")
+        else:
+            logger.info(f"Job {job_id}: FFmpeg successful.")
+            logger.info(f"Job {job_id}: Output video at {local_output_path}")
 
         final_output_details = {}
         if output_type == "gdrive":
@@ -139,9 +148,14 @@ def process_video_assembly(data, job_id):
              final_output_details = {"s3_bucket": uploaded_info.get('bucket'), "s3_key": uploaded_info.get('object_key'), "url": uploaded_info.get('url'), "storage_type": "s3"}
         else: raise ValueError(f"Unsupported output type: {output_type}")
         return final_output_details
-    except Exception as e: logger.error(f"Job {job_id}: Error during video assembly: {e}", exc_info=True); raise
+    except Exception as e:
+        logger.error(f"Job {job_id}: Error during video assembly: {e}", exc_info=True)
+        raise
     finally:
         logger.info(f"Job {job_id}: Cleaning up temp directory: {temp_dir}")
         if os.path.exists(temp_dir):
-            try: shutil.rmtree(temp_dir); logger.info(f"Job {job_id}: Temp directory cleaned up.")
-            except Exception as ce: logger.error(f"Job {job_id}: Error cleaning up {temp_dir}: {ce}", exc_info=True)
+            try:
+                shutil.rmtree(temp_dir)
+                logger.info(f"Job {job_id}: Temp directory cleaned up.")
+            except Exception as ce:
+                logger.error(f"Job {job_id}: Error cleaning up {temp_dir}: {ce}", exc_info=True)
